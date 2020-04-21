@@ -53,9 +53,47 @@ export class RMQService {
 	}
 
 	public async init(): Promise<void> {
-		this.logger.log(CONNECTING_MESSAGE);
-		const connectionURLs: string[] = this.options.connections.map((connection: IRMQConnection) => {
-			return `amqp://${connection.login}:${connection.password}@${connection.host}`;
+		return new Promise((resolve) => {
+			this.logger.log(CONNECTING_MESSAGE);
+			const connectionURLs: string[] = this.options.connections.map((connection: IRMQConnection) => {
+				return `amqp://${connection.login}:${connection.password}@${connection.host}`;
+			});
+			const connectionOptions = {
+				reconnectTimeInSeconds: this.options.reconnectTimeInSeconds
+					? this.options.reconnectTimeInSeconds
+					: DEFAULT_RECONNECT_TIME,
+			};
+			this.server = amqp.connect(connectionURLs, connectionOptions);
+			this.channel = this.server.createChannel({
+				json: false,
+				setup: async (channel: Channel) => {
+					await channel.assertExchange(this.options.exchangeName, EXCHANGE_TYPE, {
+						durable: this.options.isExchangeDurable ? this.options.isExchangeDurable : true,
+					});
+					await channel.prefetch(
+						this.options.prefetchCount ? this.options.prefetchCount : 0,
+						this.options.isGlobalPrefetchCount ? this.options.isGlobalPrefetchCount : false
+					);
+					await channel.consume(
+						this.replyQueue,
+						(msg: Message) => {
+							this.sendResponseEmitter.emit(msg.properties.correlationId, msg);
+						},
+						{ noAck: true }
+					);
+					this.waitForReply();
+					if (this.options.queueName) {
+						this.listen(channel);
+					}
+					this.logger.log(CONNECTED_MESSAGE);
+					resolve();
+				},
+			});
+		
+			this.server.on(DISCONNECT_EVENT, err => {
+				this.logger.error(DISCONNECT_MESSAGE);
+				this.logger.error(err.err);
+			});
 		});
 		const connectionOptions = {
 			reconnectTimeInSeconds: this.options.reconnectTimeInSeconds ?? DEFAULT_RECONNECT_TIME
@@ -116,7 +154,7 @@ export class RMQService {
 				replyTo: this.replyQueue,
 				correlationId,
 			});
-			this.logger.debug(`[${topic}] ${JSON.stringify(message)}`);
+			this.logger.debug(`[${topic}], ${correlationId}, ${JSON.stringify(message)}`);
 		});
 	}
 
@@ -181,7 +219,7 @@ export class RMQService {
 				...this.buildError(error),
 			},
 		});
-		this.logger.debug(`[${msg.fields.routingKey}] ${JSON.stringify(res)}`);
+		this.logger.debug(`[${msg.fields.routingKey}], ${msg.properties.correlationId}, ${JSON.stringify(res)}`);
 	}
 
 	private getUniqId(): string {
